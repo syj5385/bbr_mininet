@@ -1,3 +1,4 @@
+
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.link import TCLink
@@ -5,21 +6,17 @@ from mininet.log import setLogLevel
 from mininet.cli import CLI
 from mininet.clean import cleanup
 
-from helper.util import print_error, print_warning, print_success
-from helper.util import get_git_revision_hash, get_host_version, get_available_algorithms, check_tools
 from helper.util import sleep_progress_bar
 
+import argparse
 import os
 import sys
 import subprocess
 import time
-import argparse
-import re
+import threading # for trace ss
 
-
-MAX_HOST_NUMBER = 256**2
-GOODPUT_INTERVAL = 200
-
+out_dir = './out'
+output_dir = ''
 
 class DumbbellTopo(Topo):
     "Three switchs connected to n senders and receivers."
@@ -38,325 +35,299 @@ class DumbbellTopo(Topo):
             receiver = self.addHost('r%s' % h, cpu=1 / n)
             self.addLink(receiver, switch3)
 
+def finally_mininet(qdisc, net, hostlist):
+    print ('remove ifb and act_mirred kernel module')
+    os.system('rmmod ifb')
+    os.system('rmmod act_mirred')
 
-def parseConfigFile(file):
-    cc_algorithms = get_available_algorithms()
+    print ('Disable bbrv2 printk debugging')
+    os.system('echo 0 > /sys/module/tcp_bbr2/parameters/debug_port_mask')
+    os.system('echo 0 > /sys/module/tcp_bbr2/parameters/debug_with_printk')
 
-    unknown_alorithms = []
-    number_of_hosts = 0
-    output = []
-    f = open(file)
-    for line in f:
-        line = line.replace('\n', '').strip()
+def setup_htb_and_qdisc(aqm_switch, qdisc, netem_switch, rate, delay, limit, loss):
+    #os.system('rmmod ifb')
+    os.system('modprobe ifb numifbs=1')
+    os.system('modprobe act_mirred')
 
-        if len(line) > 1:
-            if line[0] == '#':
-                continue
+    # clear old queueing disciplines (qdisc) on the interfaces
+    aqm_switch.cmd('tc qdisc del dev {}-eth1 root'.format(aqm_switch))
+    aqm_switch.cmd('tc qdisc del dev {}-eth1 ingress'.format(aqm_switch))
+    aqm_switch.cmd('tc qdisc del dev {}-ifb0 root'.format(aqm_switch))
+    aqm_switch.cmd('tc qdisc del dev {}-ifb0 ingress'.format(aqm_switch))
 
-        split = line.split(',')
-        if split[0] == '':
-            continue
-        command = split[0].strip()
+    # create ingress ifb0 on client interface.
+    aqm_switch.cmd('tc qdisc add dev {}-eth1 handle ffff: ingress'.format(aqm_switch))
+    aqm_switch.cmd('ip link add {}-ifb0 type ifb'.format(aqm_switch))
+    aqm_switch.cmd('ip link set dev {}-ifb0 up'.format(aqm_switch))
+    aqm_switch.cmd('ifconfig {}-ifb0 txqueuelen 1000'.format(aqm_switch))
 
-        if command == 'host':
-            if len(split) != 5:
-                print_warning('Too few arguments to add host in line\n{}'.format(line))
-                continue
-            algorithm = split[1].strip()
-            rtt = split[2].strip()
-            start = float(split[3].strip())
-            stop = float(split[4].strip())
-            if algorithm not in cc_algorithms:
-                if algorithm not in unknown_alorithms:
-                    unknown_alorithms.append(algorithm)
-                continue
+    # forward all ingress traffic to the ifb device
+    aqm_switch.cmd('tc filter add dev {}-eth1 parent ffff: protocol all u32 '
+               'match u32 0 0 action mirred egress redirect '
+               'dev {}-ifb0'.format(aqm_switch,aqm_switch))
 
-            if number_of_hosts >= MAX_HOST_NUMBER:
-                print_warning('Max host number reached. Skipping further hosts.')
-                continue
+    # create an egress filter on the IFB device
+    aqm_switch.cmd('tc qdisc add dev {}-ifb0 root handle 1: '
+               'htb default 11'.format(aqm_switch))
 
-            number_of_hosts += 1
-            output.append({
-                'command': command,
-                'algorithm': algorithm,
-                'rtt': rtt,
-                'start': start,
-                'stop': stop})
+    # Add root class HTB with rate limiting 
+    aqm_switch.cmd('tc class add dev {}-ifb0 parent 1: classid 1:11 '
+               'htb rate {}mbit'.format(aqm_switch,rate))
 
-        elif command == 'link':
-            if len(split) != 4:
-                print_warning('Too few arguments to change link in line\n{}'.format(line))
-                continue
-            change = split[1].strip()
-            if change != 'bw' and change != 'rtt':
-                print_warning('Unknown link option "{} in line\n{}'.format(change, line))
-                continue
-            value = split[2].strip()
-            start = float(split[3].strip())
-            output.append({
-                'command': command,
-                'change': change,
-                'value': value,
-                'start': start
-            })
-        else:
-            print_warning('Skip unknown command "{}" in line\n{}'.format(command, line))
-            continue
+#aqm_switch.cmd('tc qdisc add dev {}-eth2 root netem delay 10ms'.format(aqm_switch))
 
-    if len(unknown_alorithms) > 0:
-        print_warning('Skipping uninstalled congestion control algorithm:\n  ' + ' '.join(unknown_alorithms))
-        print_warning('Available algorithms:\n  ' + cc_algorithms.strip())
-        print_warning('Start Test anyway in 10s. (Press ^C to interrupt)')
-        try:
-            time.sleep(10)
-        except KeyboardInterrupt:
-            sys.exit(1)
+    print ('QDISC : {}'.format(qdisc))
 
-    return output
+#netem_switch.cmd('tc qdisc add dev {}-eth2 root netem delay 10ms'.format(netem_switch))
+#print ('{} QDISC : {}'.format(netem_switch,netem_switch.cmd('tc qdisc show dev {}-eth2'.format(netem_switch))))
+
+    
+    # Add qdisc for bottleneck
+    if qdisc != '':
+        aqm_switch.cmd('tc qdisc add dev {}-ifb0 parent 1:11 handle 20: {}'.format(aqm_switch, qdisc))
+
+    else : 
+        if int(loss) != 0:
+            aqm_switch.cmd('tc qdisc add dev {}-ifb0 parent 1:11 handle 20: netem delay {}ms limit {} loss {}%'.format(aqm_switch,delay, limit, loss))
+        else :
+            aqm_switch.cmd('tc qdisc add dev {}-ifb0 parent 1:11 handle 20: netem delay {}ms limit {}'.format(aqm_switch,delay, limit))
 
 
-def run_test(commands, directory, name, bandwidth, initial_rtt, buffer_size, buffer_limit, poll_interval):
-    duration = 0
-    start_time = 0
-    number_of_hosts = 0
-
-    output_directory = os.path.join(directory, '{}_{}'.format(time.strftime('%m%d_%H%M%S'), name))
-
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-
-    write_config = [
-        'Test Name: {}'.format(name),
-        'Date: {}'.format(time.strftime('%c')),
-        'Kernel: {}'.format(get_host_version()),
-        'Git Commit: {}'.format(get_git_revision_hash()),
-        'Initial Bandwidth: {}'.format(bandwidth),
-        'Burst Buffer: {}'.format(buffer_size),
-        'Buffer Latency: {}'.format(buffer_limit),
-        'Commands: '
-    ]
-    for cmd in commands:
-        start_time += cmd['start']
-
-        config_line = '{}, '.format(cmd['command'])
-        if cmd['command'] == 'link':
-            config_line += '{}, {}, {}'.format(cmd['change'], cmd['value'], cmd['start'])
-        elif cmd['command'] == 'host':
-            number_of_hosts += 1
-            config_line += '{}, {}, {}, {}'.format(cmd['algorithm'], cmd['rtt'], cmd['start'], cmd['stop'])
-            if start_time + cmd['stop'] > duration:
-                duration = start_time + cmd['stop']
-        write_config.append(config_line)
-
-    with open(os.path.join('{}'.format(output_directory), 'parameters.txt'), 'w') as f:
-        f.write('\n'.join(write_config))
-        f.close()
-
-    text_width = 60
-    print('-' * text_width)
-    print('Starting test: {}'.format(name))
-    print('Total duration: {}s'.format(duration))
-
-    try:
-        topo = DumbbellTopo(number_of_hosts)
-        net = Mininet(topo=topo, link=TCLink)
-        net.start()
-    except Exception as e:
-        print_error('Could not start Mininet:')
-        print_error(e)
-        sys.exit(1)
-
-    # start tcp dump
-    try:
-        FNULL = open(os.devnull, 'w')
-        subprocess.Popen(['tcpdump', '-i', 's1-eth1', '-n', 'tcp', '-s', '88',
-                          '-w', os.path.join(output_directory, 's1.pcap')], stderr=FNULL)
-        subprocess.Popen(['tcpdump', '-i', 's3-eth1', '-n', 'tcp', '-s', '88',
-                          '-w', os.path.join(output_directory, 's3.pcap')], stderr=FNULL)
-    except Exception as e:
-        print_error('Error on starting tcpdump\n{}'.format(e))
-        sys.exit(1)
-
-    # start tcpprobe
-    os.system('modprobe -r tcp_probe')
-    os.system('modprobe tcp_probe full=1 port=5000')
-    os.system('chmod 444 /proc/net/tcpprobe')
-    os.system('timeout {} cat /proc/net/tcpprobe > {} &'.format(duration, os.path.join(output_directory, 'tcpprobe.xls')))
-
-
-    time.sleep(1)
-
-    host_counter = 0
-    for cmd in commands:
-        if cmd['command'] != 'host':
-            continue
-        send = net.get('h{}'.format(host_counter))
-        send.setIP('10.1.{}.{}/8'.format(host_counter / 256, host_counter % 256))
-        recv = net.get('r{}'.format(host_counter))
-        recv.setIP('10.2.{}.{}/8'.format(host_counter / 256, host_counter % 256))
-        host_counter += 1
-
-        # setup FQ, algorithm, netem, nc host
-        if cmd['algorithm'] == 'bbr' or cmd['algorithm'] == 'nv' or cmd['algorithm'] == 'mybbr':
-            send.cmd('tc qdisc add dev {}-eth0 root fq pacing'.format(send))
-        else:
-            send.cmd('tc qdisc add dev {}-eth0 root pfifo_fast')
-        send.cmd('ip route change 10.0.0.0/8 dev {}-eth0 congctl {}'.format(send, cmd['algorithm']))
-        send.cmd('ethtool -K {}-eth0 tso off'.format(send))
-        recv.cmd('tc qdisc add dev {}-eth0 root netem delay {}'.format(recv, cmd['rtt']))
-        recv.cmd('tcpdump -i {}-eth0 -n tcp -s 88 > {} &'.format(recv, os.path.join(output_directory,'{}.txt'.format(recv))))
-        #recv.cmd('timeout {} nc -klp 9000 > /dev/null &'.format(duration))
-        #recv.cmd('iperf -s -p 5000 &')
-        #recv.cmd('./goodput.sh .5 {} &'.format(output_directory,'goodput_{}.txt'.format(recv.IP())));
-        #recv.cmd('./goodput.sh 100 {} &'.format(os.path.join(output_directory,'goodput_{}.txt'.format(recv.IP()))))
-        recv.cmd('./server 5000 {} {} &'.format(os.path.join(output_directory,'{}.goodput'.format(recv)),GOODPUT_INTERVAL))
-
-        #time.sleep(1)
-        #recv.cmd('sudo python TCPserver.py > ./goodputResult.txt &')
-        # pull BBR values
-        send.cmd('./ss_script.sh {} >> {}.bbr &'.format(poll_interval, os.path.join(output_directory, send.IP())))
-
-    s2, s3 = net.get('s2', 's3')
-    s2.cmd('tc qdisc add dev s2-eth2 root tbf rate {} buffer {} limit {}'.format(bandwidth, buffer_size, buffer_limit))
-    netem_running = False
-    if initial_rtt != '0ms':
-        netem_running = True
-        s2.cmd('tc qdisc add dev s2-eth1 root netem delay {}'.format(initial_rtt))
-    s2.cmd('./buffer_script.sh {0} {1} >> {2}.buffer &'.format(poll_interval, 's2-eth2',
-                                                               os.path.join(output_directory, 's2-eth2-tbf')))
-
-    complete = duration
-    current_time = 0
-
-    host_counter = 0
-
-    try:
-        for cmd in commands:
-            start = cmd['start']
-            current_time = sleep_progress_bar(start, current_time=current_time, complete=complete)
-
-            if cmd['command'] == 'link':
-                s2 = net.get('s2')
-                if cmd['change'] == 'bw':
-                    s2.cmd('tc qdisc change dev s2-eth2 root tbf rate {} buffer {} limit {}'.format(cmd['value'], buffer_size, buffer_limit))
-                    print("Bottleneck : " + str(cmd['value']))
-                    log_String = '  Change bandwidth to {}.'.format(cmd['value'])
-                elif cmd['change'] == 'rtt':
-                    if netem_running:
-                        s2.cmd('tc qdisc change dev s2-eth1 root netem delay {}'.format(cmd['value']))
-                    else:
-                        netem_running = True
-                        s2.cmd('tc qdisc add dev s2-eth1 root netem delay {}'.format(cmd['value']))
-                    log_String = '  Change rtt to {}.'.format(cmd['value'])
-
-            elif cmd['command'] == 'host':
-                send = net.get('h{}'.format(host_counter))
-                recv = net.get('r{}'.format(host_counter))
-                timeout = cmd['stop']
-                log_String = '  h{}: {} {}, {} -> {}'.format(host_counter, cmd['algorithm'], cmd['rtt'], send.IP(), recv.IP())
-                #send.cmd('timeout {} nc {} 9000 < /dev/urandom > /dev/null &'.format(timeout, recv.IP()))
-                send.cmd('iperf -c {} -p 5000 -t {} -i 0.5 &'.format(recv.IP(),cmd['stop'], os.path.join(output_directory,'sender_iperf.txt'.format(send.IP()))))
-                host_counter += 1
-            print(log_String + ' ' * (text_width - len(log_String)))
-
-        current_time = sleep_progress_bar((complete - current_time) % 1, current_time=current_time, complete=complete)
-        current_time = sleep_progress_bar(complete - current_time, current_time=current_time, complete=complete)
-    except (KeyboardInterrupt, Exception) as e:
-        if isinstance(e, KeyboardInterrupt):
-            print_warning('\nReceived keyboard interrupt. Stop Mininet.')
-        else:
-            print_error(e)
-    finally:
-        time.sleep(3)
-        net.stop()
-        cleanup()
-
-    print('-' * text_width)
-
-
-def verify_arguments(args, commands):
-    verified = True
-
-    verified &= verify('rate', args.bandwidth)
-    verified &= verify('time', args.rtt)
-    verified &= verify('size', args.buffer_size)
-    verified &= verify('size', args.limit)
-
-    for c in commands:
-        if c['command'] == 'link':
-            if c['change'] == 'bw':
-                verified &= verify('rate', c['value'])
-            elif c['change'] == 'rtt':
-                verified &= verify('time', c['value'])
-        elif c['command'] == 'host':
-            verified &= verify('time', c['rtt'])
-
-    return verified
-
-
-def verify(type, value):
-    if type == 'rate':
-        allowed = ['bit', 'kbit', 'mbit', 'bps', 'kbps', 'mbps']
-    elif type == 'time':
-        allowed = ['s', 'ms', 'us']
-    elif type == 'size':
-        allowed = ['b', 'kbit', 'mbit', 'kb', 'k', 'mb', 'm']
+    # setup network emulator : delay / limit / loss
+    # in AQM configuration, limit will be set default txqueuelen
+    """
+    command = ''
+    if loss != 0:
+        command = 'tc qdisc add dev {}-eth2 root netem delay {}ms loss {}% limit 1000'.format(netem_switch, delay, loss)
     else:
-        allowed = []  # Unknown type
+        command = 'tc qdisc add dev {}-eth2 root netem delay {}ms limit 1000'.format(netem_switch, delay, loss)
 
-    si = re.sub('^([0-9]+\.)?[0-9]+', '', value).lower()
+    print ("command : {}".format(command))
+    netem_switch.cmd(command)
+    """
 
-    if si not in allowed:
-        print_error('Malformed {} unit: {} not in {}'.format(type, value, list(allowed)))
-        return False
+
+def configure_switch(net, delay=0, limit=1000, rate = 10, loss=0, qdisc='', directory=out_dir):
+
+    print ("Configure 3 switches")
+    
+    os.system('sysctl -w net.core.rmem_max=250000000 net.ipv4.tcp_rmem=\'4096 131072 250000000\'')
+    os.system('sysctl -w net.core.wmem_max=250000000 net.ipv4.tcp_wmem=\'4096  16384 250000000\'')
+
+    s1 = net.get('s1')
+    s2 = net.get('s2')
+    s3 = net.get('s3')
+
+    s1.cmd('ethtool -K s1-eth1 tso off gso off gro off')
+    s1.cmd('ethtool -K s1-eth2 tso off gso off gro off')
+    s2.cmd('ethtool -K s2-eth1 tso off gso off gro off')
+    s2.cmd('ethtool -K s2-eth2 tso off gso off gro off')
+    s3.cmd('ethtool -K s3-eth1 tso off gso off gro off')
+    s3.cmd('ethtool -K s3-eth2 tso off gso off gro off')
+
+    setup_htb_and_qdisc(aqm_switch=s2, qdisc = qdisc, netem_switch=s1, rate = rate, delay = delay, limit = limit, loss = loss)
+
+    print ('<switch 1>')
+    print ('eth1 : {}'.format(s1.cmd('tc qdisc show dev s1-eth1')))
+    print ('eth2 : {}'.format(s1.cmd('tc qdisc show dev s1-eth2')))
+    print ('\n<switch 2>')
+    print ('eth1 : {}'.format(s2.cmd('tc qdisc show dev s2-eth1')))
+    print ('ifb0 : {}'.format(s2.cmd('tc qdisc show dev s2-ifb0')))
+    print ('eth2 : {}'.format(s2.cmd('tc qdisc show dev s2-eth2')))
+    print ('\n<switch 3>')
+    print ('eth1 : {}'.format(s3.cmd('tc qdisc show dev s3-eth1')))
+    print ('eth2 : {}'.format(s3.cmd('tc qdisc show dev s3-eth2')))
+
+
+    print ('------      ++++++      ++++++      ++++++      ------')
+    print ('-    -------+    +------+    +      +    +-------    -')
+    print ('- hh -======+ s1 +======+ s2 +******+ s3 +======- rr -')
+    print ('-    -------+    +------+    +      +    +-------    -')
+    print ('------      ++++++      ++++++      ++++++      ------')
+    try:
+        FNULL=open(os.devnull, 'w')
+        subprocess.Popen(['tcpdump', '-i', 's1-eth1', '-n', 'tcp', '-w', '{}/s1.pcap'.format(directory), '-s', '88'], stderr=FNULL)
+        subprocess.Popen(['tcpdump', '-i', 's3-eth1', '-n', 'tcp', '-w', '{}/s3.pcap'.format(directory), '-s', '88'], stderr=FNULL)
+
+    except Exception as e:
+        print('Error on starting tcpdump\n{}'.format(e))
+        sys.exit(1)
+
+    time.sleep(0.2)
+
+def enable_ecn_in_bbr2(host):
+    host.cmd('sysctl -w net.ipv4.tcp_ecn=1')
+    host.cmd('echo 1 > /sys/module/tcp_bbr2/parameters/ecn_enable')
+    host.cmd('echo 0 > /sys/module/tcp_bbr2/parameters/ecn_max_rtt_us')
+    #print (host.cmd('egrep . /sys/module/tcp_bbr2/parameters/ecn_enable'))
+    #print (host.cmd('egrep . /sys/module/tcp_bbr2/parameters/ecn_max_rtt_us'))
+
+def disable_ecn_in_bbr2(host):
+    host.cmd('echo 0 > /sys/module/tcp_bbr2/parameters/ecn_enable')
+    host.cmd('echo 5000 > /sys/module/tcp_bbr2/parameters/ecn_max_rtt_us')
+    print ("Disable ecn in bbr2 host : {}".format(host))
+    #print (host.cmd('egrep . /sys/module/tcp_bbr2/parameters/ecn_enable'))
+    #print (host.cmd('egrep . /sys/module/tcp_bbr2/parameters/ecn_max_rtt_us'))
+    host.cmd('sysctl -w net.ipv4.tcp_ecn=2')
+
+def configure_host(net, hostlist, bbr2_ecn, duration=10, interval=0):
+    for i in range(len(hostlist)):
+        tmp = hostlist[i].split(':')
+        cca = tmp[0]
+        flow_delay = tmp[1]
+        send = net.get('h{}'.format(i))
+        recv = net.get('r{}'.format(i))
+
+        send.cmd('ethtool -K {}-eth0 tso off gso off gro off'.format(send))
+        recv.cmd('ethtool -K {}-eth0 tso off gso off gro off'.format(recv))
+
+#if cca == 'bbr' or cca == 'bbr2':
+#       	send.cmd('tc qdisc add dev {}-eth0 root fq pacing'.format(send))
+#       else :
+        send.cmd('tc qdisc add dev {}-eth0 root netem delay 0.1ms'.format(send))
+
+        send.setIP('10.1.0.{}/8'.format(i))
+        recv.setIP('10.2.0.{}/8'.format(i))
+
+        send.cmd('ip route change 10.0.0.0/8 dev {}-eth0 congctl {}'.format(send,cca))
+        recv.cmd('tc qdisc add dev {}-eth0 root netem delay {}'.format(recv,flow_delay))
+#send.cmd('tcpdump -i {}-eth0 -n tcp -w {}/{}.pacp -s 88 &'.format(send, output_dir, send))
+
+        if cca == "bbr2":
+            send.cmd('dmesg -w | grep {} > {} &'.format(recv.IP(), os.path.join(output_dir, 'bbr2_{}.xls'.format(send.IP()))))
+
+
+        print(send.cmd('tc qdisc show dev {}-eth0'.format(send)))
+        print ('{} -> ECN : {}'.format(hostlist[i], bbr2_ecn))
+        if int(bbr2_ecn) == 1:
+            print (" --> Enable ecn in bbr2 host : {}".format(send)),
+            enable_ecn_in_bbr2(send)
+
+#recv.cmd('iperf3 -s -p 10000 &')
+#recv.cmd('./server 10000 {} {} &'.format(os.path.join(output_dir,'{}.goodput'.format(recv)), 200))
+        recv.cmd('iperf -s -p 10000 &')
+#send.cmd('iperf -c {} -p 10000 -t {} &'.format(recv.IP(), duration))
+        send.cmd('./ss_script.sh {} >> {}.bbr &'.format(0.02, os.path.join(output_dir, send.IP()))) 
+        print ('')
+
+    rest_duration=int(duration)
+
+    for i in range(len(hostlist)):
+        send = net.get('h{}'.format(i))
+        recv = net.get('r{}'.format(i))
+        print ("Send Application")
+        send.cmd('iperf -c {} -p 10000 -t {} &'.format(recv.IP(), duration))
+        try:
+            time.sleep(float(interval))
+        except (KeyboardInterrupt, Exception ) as e :
+            return
+        rest_duration = rest_duration - float(interval)
+
+    start_ss_script(net, interval=0.05)
+    progress_bar(duration=rest_duration)
+    
+    for i in range(len(hostlist)):
+        tmp = hostlist[i].split(':')
+        cca = tmp[0]
+        if int(bbr2_ecn) == 1:
+            send = net.get('h{}'.format(i))
+            disable_ecn_in_bbr2(send)
     return True
 
+def verifyHost(host):
+    # check host string verification 
+    hostlist = host.split(',')
+    return hostlist
+
+def start_ss_script(net, interval=0.02):
+    s2 = net.get('s2')
+    s2.cmd('./buffer_script.sh {} {} >> {}.buffer &'.format(0.05, 's2-ifb0', os.path.join(output_dir, 's2-eth2-tbf')))
+        
+def progress_bar(duration):
+    complete = int(duration)
+    current_time = 0
+
+    try:
+        current_time = sleep_progress_bar((complete - current_time) % 1, current_time = current_time, complete = complete)
+        current_time = sleep_progress_bar(complete - current_time, current_time = current_time, complete = complete)
+    except (KeyboardInterrupt, Exception ) as e :
+        if  isinstance (e, KeyboardInterrupt):
+            print ("Keyboard Interrupted. Stop Mininet")
+
+    finally:
+        time.sleep(1)
+        #net.stop()
+        #cleanup()
+        #finally_mininet()
+        print ("")
+        return
+
+def output_directory(target) : 
+    if not os.path.exists(out_dir) : 
+        os.makedirs(out_dir)
+
+    output_dir = os.path.join(out_dir, '{}_{}'.format(target, time.strftime('%m%d_%H%M%S')))
+    os.makedirs(output_dir)
+
+    return output_dir
 
 if __name__ == '__main__':
-    if check_tools() > 0:
-        exit(1)
-
+    # Parsing input argument
     parser = argparse.ArgumentParser()
-    parser.add_argument('config', metavar='CONFIG',
-                        help='Path to the config file.')
-    parser.add_argument('-b', dest='bandwidth',
-                        default='10Mbit', help='Initial bandwidth of the bottleneck link. (default: 10mbit)')
-    parser.add_argument('-r', dest='rtt',
-                        default='0ms', help='Initial rtt for all flows. (default 0ms)')
-    parser.add_argument('-d', dest='directory',
-                        default='test/', help='Path to the output directory. (default: test/)')
-    parser.add_argument('-s', dest='buffer_size',
-                        default='1600b', help='Maximum size of bottleneck buffer. (default : 62500b)')
-    parser.add_argument('-l', dest='limit',
-                        default='62500b', help='Maximum latency at the bottleneck buffer. (default: 100ms)')
-    parser.add_argument('-n', dest='name',
-                        default='TCP', help='Name of the output directory. (default: TCP)')
-    parser.add_argument('--poll-interval', dest='poll_interval', type=float,
-                        default=0.04, help='Interval to poll TCP values and buffer backlog in seconds. (default: 0.04)')
+    parser.add_argument('-b', dest='rate',
+                        default=10, help='Initial bandwidth of the bottleneck link (default : 10Mbps')
+    parser.add_argument('-l', dest='limit_byte',
+                        default=5, help='Initial bottleneck buffer size in byte (default : 25000b)')
+    parser.add_argument('-r', dest='delay', 
+                        default=0, help='Iniitial delay switch 1 and switch 3 (default : 0ms)')
+    parser.add_argument('-d', dest='duration', 
+                        default=10, help='Test duration (default : 10 sec)')
+    parser.add_argument('-n', dest='output',
+                        default='Congctl', help='Set output directory name (default : Congctl)')
+    parser.add_argument('-q', dest='qdisc',
+                        default='', help='Set AQM (Active Queue Management) policy on the switch 2 (default : netem)')
+    parser.add_argument('-c', dest='host',
+                        default='bbr:10ms', help='Set sending host. <example> bbr:10ms  bbr:10ms,cubic:20ms  (default : bbr:10ms)')
+    parser.add_argument('-e', dest='my_ecn',
+                         default=0, help='enable or disable ECN from switch 2 (default: 1)')
+    parser.add_argument('-p', dest='loss',
+                        default=0, help='set packet loss rate')
+    parser.add_argument('-i', dest='interval',
+                        default=0, help='interval among flows')
+    arg = parser.parse_args()
 
-    args = parser.parse_args()
+    output_dir = output_directory(arg.output)
+    
+    hostlist = verifyHost(arg.host)
+    topo = DumbbellTopo(len(hostlist))
+    net = Mininet(topo=topo, link=TCLink)
 
-    if not os.path.isfile(args.config):
-        print_error('Config file missing: {}'.format(args.config))
-        sys.exit(128)
+    #limit = int(arg.rate) *  * 1000 / (8*1514) 
+    limit_packet = int(arg.limit_byte) / 1514; # 1514 : mtu size
 
-    commands = parseConfigFile(args.config)
-    if len(commands) == 0:
-        print_error('No valid commands found in config file.')
-        sys.exit(128)
+    print ("ECN enabled : {}".format(arg.my_ecn))
 
-    if not verify_arguments(args, commands):
-        print_error('Please fix malformed parameters.')
-        sys.exit(128)
+    net.start()
 
-    print(args.bandwidth)
+    print ("Enable BBR printk")
+    os.system('dmesg -c > /dev/null')
+    os.system('echo 55534 > /sys/module/tcp_bbr2/parameters/debug_port_mask')
+    os.system('echo 1 > /sys/module/tcp_bbr2/parameters/debug_with_printk')
 
-    # setLogLevel('info')
-    run_test(bandwidth=args.bandwidth,
-             initial_rtt=args.rtt,
-             commands=commands,
-             buffer_size=args.buffer_size,
-             buffer_limit=args.limit,
-             name=args.name,
-             directory=args.directory,
-             poll_interval=args.poll_interval)
+    configure_switch(net, 
+            delay=arg.delay, 
+            limit=limit_packet,
+            rate=arg.rate, 
+            loss=arg.loss, 
+            qdisc=arg.qdisc,
+            directory = output_dir)
+
+    configure_host(net, hostlist=hostlist, duration=arg.duration, bbr2_ecn=arg.my_ecn, interval = arg.interval)
+
+
+    #CLI(net)
+
+    finally_mininet(arg.qdisc, net=net, hostlist=hostlist)
+    net.stop()
+    cleanup()
+
